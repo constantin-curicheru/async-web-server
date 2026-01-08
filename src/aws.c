@@ -75,7 +75,7 @@ void connection_start_async_io(struct connection *conn)
 }
 
 void connection_remove(struct connection *conn)
-{
+{   
 	/* TODO: Remove connection handler. */
 }
 
@@ -195,13 +195,35 @@ int main(void)
 {
 	int rc;
 
-	/* TODO: Initialize asynchronous operations. */
+	/* Initialize asynchronous operations. */
+    ctx = 0;
+    rc = io_setup(128, &ctx);
+	/* Initialize multiplexing. */
+    epollfd = epoll_create1(0);
+	/* Create server socket. */
+    listenfd = socket(PF_INET, SOCK_STREAM, 0);
 
-	/* TODO: Initialize multiplexing. */
+    int enable = 1;
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
 
-	/* TODO: Create server socket. */
+    // Making it non-blocking
+    int flags = fcntl(listenfd, F_GETFL, 0);
+    fcntl(listenfd, F_SETFL, flags | O_NONBLOCK);
 
-	/* TODO: Add server socket to epoll object*/
+    // Binding socket to a port
+    struct sockaddr_in sckinfo;
+    memset(&sckinfo, 0, sizeof(sckinfo));
+    sckinfo.sin_family = AF_INET;
+    sckinfo.sin_addr.s_addr = INADDR_ANY;
+    sckinfo.sin_port = htons(AWS_LISTEN_PORT);
+    bind(listenfd, (struct sockaddr *)&sckinfo, sizeof(sckinfo));
+    
+    listen(listenfd, 5);
+	/* Add server socket to epoll object*/
+    struct epoll_event epev;
+    epev.data.fd = listenfd;
+    epev.events = EPOLLIN;
+    rc = epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &epev);
 
 	/* Uncomment the following line for debugging. */
 	// dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
