@@ -64,7 +64,17 @@ static enum resource_type connection_get_resource_type(struct connection *conn)
 struct connection *connection_create(int sockfd)
 {
 	/* TODO: Initialize connection structure on given socket. */
-	return NULL;
+    struct connection *conn = calloc(1, sizeof(struct connection));
+
+    conn->sockfd = sockfd;
+    conn->fd = -1;
+    conn->state = STATE_INITIAL;
+
+    conn->ctx = ctx;
+
+    conn->eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+	return conn;
 }
 
 void connection_start_async_io(struct connection *conn)
@@ -82,16 +92,28 @@ void connection_remove(struct connection *conn)
 void handle_new_connection(void)
 {
 	/* TODO: Handle a new connection request on the server socket. */
-
+    int clientfd;
+    struct sockaddr_in client_addr;
+    socklen_t client_length = sizeof(client_addr);
 	/* TODO: Accept new connection. */
+    clientfd = accept(listenfd, (struct sockaddr *)&client_addr, &client_length);
 
 	/* TODO: Set socket to be non-blocking. */
+    int flags = fcntl(clientfd, F_GETFL, 0);
+    fcntl(clientfd, F_SETFL, flags | O_NONBLOCK);
 
 	/* TODO: Instantiate new connection handler. */
+    struct connection *conn = connection_create(clientfd);
 
 	/* TODO: Add socket to epoll. */
+    struct epoll_event epev;
+    epev.data.ptr = conn;
+    epev.events = EPOLLIN;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, clientfd, &epev);
 
 	/* TODO: Initialize HTTP_REQUEST parser. */
+    http_parser_init(&conn->request_parser, HTTP_REQUEST);
+    conn->request_parser.data = conn;
 }
 
 void receive_data(struct connection *conn)
@@ -198,19 +220,20 @@ int main(void)
 	/* Initialize asynchronous operations. */
     ctx = 0;
     rc = io_setup(128, &ctx);
+
 	/* Initialize multiplexing. */
     epollfd = epoll_create1(0);
+
 	/* Create server socket. */
     listenfd = socket(PF_INET, SOCK_STREAM, 0);
-
     int enable = 1;
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
 
-    // Making it non-blocking
+    // making it non-blocking
     int flags = fcntl(listenfd, F_GETFL, 0);
     fcntl(listenfd, F_SETFL, flags | O_NONBLOCK);
 
-    // Binding socket to a port
+    // binding socket to a port
     struct sockaddr_in sckinfo;
     memset(&sckinfo, 0, sizeof(sckinfo));
     sckinfo.sin_family = AF_INET;
@@ -219,6 +242,7 @@ int main(void)
     bind(listenfd, (struct sockaddr *)&sckinfo, sizeof(sckinfo));
     
     listen(listenfd, 5);
+
 	/* Add server socket to epoll object*/
     struct epoll_event epev;
     epev.data.fd = listenfd;
@@ -233,11 +257,19 @@ int main(void)
 		struct epoll_event rev;
 
 		/* TODO: Wait for events. */
+        int nr_trg_ev = epoll_wait(epollfd, &rev, 1, -1);
 
 		/* TODO: Switch event types; consider
 		 *   - new connection requests (on server socket)
 		 *   - socket communication (on connection sockets)
 		 */
+        if (rev.data.fd == listenfd) {
+            // listenfd reciver client
+            handle_new_connection();
+        } else {
+            // client sent request
+
+        }
 	}
 
 	return 0;
