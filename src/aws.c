@@ -54,16 +54,22 @@ static void connection_prepare_send_404(struct connection *conn)
 
 static enum resource_type connection_get_resource_type(struct connection *conn)
 {
-	/* TODO: Get resource type depending on request path/filename. Filename should
+	/* Get resource type depending on request path/filename. Filename should
 	 * point to the static or dynamic folder.
 	 */
+    if (strstr(conn->request_path, AWS_ABS_STATIC_FOLDER)) {
+        return RESOURCE_TYPE_STATIC;
+    }
+    if (strstr(conn->request_path, AWS_ABS_STATIC_FOLDER)) {
+        return RESOURCE_TYPE_DYNAMIC;
+    }
 	return RESOURCE_TYPE_NONE;
 }
 
 
 struct connection *connection_create(int sockfd)
 {
-	/* TODO: Initialize connection structure on given socket. */
+	/* Initialize connection structure on given socket. */
     struct connection *conn = calloc(1, sizeof(struct connection));
 
     conn->sockfd = sockfd;
@@ -121,9 +127,39 @@ void handle_new_connection(void)
 
 void receive_data(struct connection *conn)
 {
-	/* TODO: Receive message on socket.
+	/* Receive message on socket.
 	 * Store message in recv_buffer in struct connection.
 	 */
+    char buff[32];
+    int rc;
+
+    rc = get_peer_address(conn->sockfd, buff, 32);
+    if (rc < 0) {
+		ERR("get_peer_address");
+		connection_remove(conn);
+		return;
+	}
+
+    ssize_t rc_recv = recv(conn->sockfd, 
+				   conn->recv_buffer + conn->recv_len, 
+				   BUFSIZ - conn->recv_len, 0);
+
+	if (rc_recv < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return;
+		}
+		connection_remove(conn);
+		return;
+	}
+
+	if (rc_recv == 0) {
+		connection_remove(conn);
+		return;
+	}
+
+    conn->recv_len += rc_recv;
+	conn->state = STATE_RECEIVING_DATA;
+
 }
 
 int connection_open_file(struct connection *conn)
@@ -142,7 +178,7 @@ void connection_complete_async_io(struct connection *conn)
 
 int parse_header(struct connection *conn)
 {
-	/* TODO: Parse the HTTP header and extract the file path. */
+	/* Parse the HTTP header and extract the file path. */
 	/* Use mostly null settings except for on_path callback. */
 	http_parser_settings settings_on_path = {
 		.on_message_begin = 0,
@@ -156,7 +192,19 @@ int parse_header(struct connection *conn)
 		.on_headers_complete = 0,
 		.on_message_complete = 0
 	};
-	return 0;
+    
+    size_t bytes_parsed;
+	
+	bytes_parsed = http_parser_execute(&conn->request_parser, 
+									   &settings_on_path, 
+									   conn->recv_buffer, 
+									   conn->recv_len);
+
+	if (conn->have_path) {
+		return 0;
+	}
+
+	return -1;
 }
 
 enum connection_state connection_send_static(struct connection *conn)
@@ -189,8 +237,32 @@ void handle_input(struct connection *conn)
 	/* TODO: Handle input information: may be a new message or notification of
 	 * completion of an asynchronous I/O operation.
 	 */
-
+    int rc;
 	switch (conn->state) {
+    case STATE_INITIAL:
+	case STATE_RECEIVING_DATA:
+		receive_data(conn);
+
+		if (conn->state == STATE_CONNECTION_CLOSED)
+			return;
+		
+		rc = parse_header(conn);
+		if (rc < 0)
+            // didnt read full header
+			return;
+
+		conn->state = STATE_REQUEST_RECEIVED;
+		
+		rc = connection_open_file(conn);
+
+		w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
+		break;
+	
+	case STATE_ASYNC_ONGOING:
+		/* We shouldn't receive input on socket here, but this state is entered
+		   when the eventfd triggers in handle_client */
+		connection_complete_async_io(conn);
+		break;
 	default:
 		printf("shouldn't get here %d\n", conn->state);
 	}

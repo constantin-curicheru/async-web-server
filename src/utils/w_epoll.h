@@ -13,7 +13,8 @@ extern "C" {
 
 static inline int w_epoll_create(void)
 {
-	return epoll_create(10);
+    // updated to newer version
+	return epoll_create1(0);
 }
 
 static inline int w_epoll_add_fd_in(int epollfd, int fd)
