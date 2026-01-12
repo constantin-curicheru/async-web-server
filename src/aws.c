@@ -91,27 +91,30 @@ void connection_remove(struct connection *conn)
 
 void handle_new_connection(void)
 {
-	/* TODO: Handle a new connection request on the server socket. */
+	/* Handle a new connection request on the server socket. */
     int clientfd;
     struct sockaddr_in client_addr;
     socklen_t client_length = sizeof(client_addr);
-	/* TODO: Accept new connection. */
+	/* Accept new connection. */
     clientfd = accept(listenfd, (struct sockaddr *)&client_addr, &client_length);
+	DIE(clientfd < 0, "accept");
 
-	/* TODO: Set socket to be non-blocking. */
-    int flags = fcntl(clientfd, F_GETFL, 0);
-    fcntl(clientfd, F_SETFL, flags | O_NONBLOCK);
+	/* Set socket to be non-blocking. */
+    int rc;
+	int flags;
+    flags = fcntl(clientfd, F_GETFL, 0);
+	DIE(flags < 0, "fcntl F_GETFL");
+	rc = fcntl(clientfd, F_SETFL, flags | O_NONBLOCK);
+	DIE(rc < 0, "fcntl F_SETFL");
 
-	/* TODO: Instantiate new connection handler. */
+	/* Instantiate new connection handler. */
     struct connection *conn = connection_create(clientfd);
 
-	/* TODO: Add socket to epoll. */
-    struct epoll_event epev;
-    epev.data.ptr = conn;
-    epev.events = EPOLLIN;
-    epoll_ctl(epollfd, EPOLL_CTL_ADD, clientfd, &epev);
+	/* Add socket to epoll. */
+    rc = w_epoll_add_ptr_in(epollfd, clientfd, conn);
+	DIE(rc < 0, "w_epoll_add_ptr_in");
 
-	/* TODO: Initialize HTTP_REQUEST parser. */
+	/* Initialize HTTP_REQUEST parser. */
     http_parser_init(&conn->request_parser, HTTP_REQUEST);
     conn->request_parser.data = conn;
 }
@@ -208,9 +211,21 @@ void handle_output(struct connection *conn)
 
 void handle_client(uint32_t event, struct connection *conn)
 {
-	/* TODO: Handle new client. There can be input and output connections.
+	/* Handle new client. There can be input and output connections.
 	 * Take care of what happened at the end of a connection.
 	 */
+    if (event & (EPOLLERR | EPOLLHUP)) {
+        connection_remove(conn);
+        return;
+    }
+
+    if (event & EPOLLIN) {
+        handle_input(conn);
+    }
+
+    if (event & EPOLLOUT) {
+        handle_output(conn);
+    }
 }
 
 int main(void)
@@ -219,35 +234,24 @@ int main(void)
 
 	/* Initialize asynchronous operations. */
     ctx = 0;
-    rc = io_setup(128, &ctx);
+	rc = io_setup(128, &ctx);
+	DIE(rc < 0, "io_setup");
 
 	/* Initialize multiplexing. */
-    epollfd = epoll_create1(0);
+    epollfd = w_epoll_create();
+	DIE(epollfd < 0, "w_epoll_create");
 
 	/* Create server socket. */
-    listenfd = socket(PF_INET, SOCK_STREAM, 0);
-    int enable = 1;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+    listenfd = tcp_create_listener(AWS_LISTEN_PORT, DEFAULT_LISTEN_BACKLOG);
+	DIE(listenfd < 0, "tcp_create_listener");
 
     // making it non-blocking
     int flags = fcntl(listenfd, F_GETFL, 0);
     fcntl(listenfd, F_SETFL, flags | O_NONBLOCK);
 
-    // binding socket to a port
-    struct sockaddr_in sckinfo;
-    memset(&sckinfo, 0, sizeof(sckinfo));
-    sckinfo.sin_family = AF_INET;
-    sckinfo.sin_addr.s_addr = INADDR_ANY;
-    sckinfo.sin_port = htons(AWS_LISTEN_PORT);
-    bind(listenfd, (struct sockaddr *)&sckinfo, sizeof(sckinfo));
-    
-    listen(listenfd, 5);
-
 	/* Add server socket to epoll object*/
-    struct epoll_event epev;
-    epev.data.fd = listenfd;
-    epev.events = EPOLLIN;
-    rc = epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &epev);
+    rc = w_epoll_add_fd_in(epollfd, listenfd);
+	DIE(rc < 0, "w_epoll_add_fd_in");
 
 	/* Uncomment the following line for debugging. */
 	// dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
@@ -257,7 +261,8 @@ int main(void)
 		struct epoll_event rev;
 
 		/* TODO: Wait for events. */
-        int nr_trg_ev = epoll_wait(epollfd, &rev, 1, -1);
+        rc = w_epoll_wait_infinite(epollfd, &rev);
+		DIE(rc < 0, "w_epoll_wait_infinite");
 
 		/* TODO: Switch event types; consider
 		 *   - new connection requests (on server socket)
@@ -268,7 +273,7 @@ int main(void)
             handle_new_connection();
         } else {
             // client sent request
-
+            handle_client(rev.events, (struct connection *)rev.data.ptr);
         }
 	}
 
