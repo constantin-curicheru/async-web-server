@@ -45,11 +45,26 @@ static int aws_on_path_cb(http_parser *p, const char *buf, size_t len)
 static void connection_prepare_send_reply_header(struct connection *conn)
 {
 	/* TODO: Prepare the connection buffer to send the reply header. */
+    conn->send_len = snprintf(conn->send_buffer, BUFSIZ,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        conn->file_size);
+    conn->send_pos = 0;
 }
 
 static void connection_prepare_send_404(struct connection *conn)
 {
 	/* TODO: Prepare the connection buffer to send the 404 header. */
+    const char *not_found_response =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    conn->send_len = strlen(not_found_response);
+    memcpy(conn->send_buffer, not_found_response, conn->send_len);
+    conn->send_pos = 0;
 }
 
 static enum resource_type connection_get_resource_type(struct connection *conn)
@@ -57,10 +72,11 @@ static enum resource_type connection_get_resource_type(struct connection *conn)
 	/* Get resource type depending on request path/filename. Filename should
 	 * point to the static or dynamic folder.
 	 */
+    dlog(LOG_INFO, "in %s conn->req path: %s\n", __func__, conn->request_path);
     if (strstr(conn->request_path, AWS_ABS_STATIC_FOLDER)) {
         return RESOURCE_TYPE_STATIC;
     }
-    if (strstr(conn->request_path, AWS_ABS_STATIC_FOLDER)) {
+    if (strstr(conn->request_path, AWS_ABS_DYNAMIC_FOLDER)) {
         return RESOURCE_TYPE_DYNAMIC;
     }
 	return RESOURCE_TYPE_NONE;
@@ -92,7 +108,17 @@ void connection_start_async_io(struct connection *conn)
 
 void connection_remove(struct connection *conn)
 {   
-	/* TODO: Remove connection handler. */
+	/* Remove connection handler. */
+    if (conn->fd >= 0) 
+		close(conn->fd);
+	
+	if (conn->sockfd >= 0) {
+		w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+		tcp_close_connection(conn->sockfd);
+	}
+	
+	conn->state = STATE_CONNECTION_CLOSED;
+	free(conn);
 }
 
 void handle_new_connection(void)
@@ -134,10 +160,11 @@ void receive_data(struct connection *conn)
     int rc;
 
     rc = get_peer_address(conn->sockfd, buff, 32);
+    // if error getting peer address
     if (rc < 0) {
 		ERR("get_peer_address");
 		connection_remove(conn);
-		return;
+		return; 
 	}
 
     ssize_t rc_recv = recv(conn->sockfd, 
@@ -158,15 +185,35 @@ void receive_data(struct connection *conn)
 	}
 
     conn->recv_len += rc_recv;
-	conn->state = STATE_RECEIVING_DATA;
 
+    if (strstr(conn->recv_buffer, "\r\n\r\n")){
+	    conn->state = STATE_REQUEST_RECEIVED;
+    } else {
+        conn->state = STATE_RECEIVING_DATA;
+    }
 }
 
 int connection_open_file(struct connection *conn)
 {
-	/* TODO: Open file and update connection fields. */
+	/* Open file and update connection fields. */
+    conn->res_type = connection_get_resource_type(conn);
+    dlog(LOG_INFO, "in %s conn->req path: %s\n", __func__, conn->request_path);
+    
+	if (conn->res_type == RESOURCE_TYPE_NONE)
+		return -1;
 
-	return -1;
+	conn->fd = open(conn->request_path, O_RDONLY);
+	if (conn->fd < 0)
+		return -1;
+
+	struct stat st;
+	if (fstat(conn->fd, &st) < 0) {
+		close(conn->fd);
+		conn->fd = -1;
+		return -1;
+	}
+	conn->file_size = st.st_size;
+	return 0;
 }
 
 void connection_complete_async_io(struct connection *conn)
@@ -194,13 +241,18 @@ int parse_header(struct connection *conn)
 	};
     
     size_t bytes_parsed;
-	
 	bytes_parsed = http_parser_execute(&conn->request_parser, 
 									   &settings_on_path, 
 									   conn->recv_buffer, 
 									   conn->recv_len);
-
-	if (conn->have_path) {
+    dlog(LOG_INFO, "in %s bytes_parsed=%zu, recv_len=%zu, path=%s\n",
+         __func__, bytes_parsed, conn->recv_len, conn->request_path);
+	if (bytes_parsed == conn->recv_len) {
+        // add a '.' at the beginning of the path
+        char temp[BUFSIZ];
+        strcpy(temp, conn->request_path);
+        conn->request_path[0] = '.';
+        strcpy(conn->request_path + 1, temp);
 		return 0;
 	}
 
@@ -216,10 +268,23 @@ enum connection_state connection_send_static(struct connection *conn)
 int connection_send_data(struct connection *conn)
 {
 	/* May be used as a helper function. */
-	/* TODO: Send as much data as possible from the connection send buffer.
+	/* Send as much data as possible from the connection send buffer.
 	 * Returns the number of bytes sent or -1 if an error occurred
 	 */
-	return -1;
+    ssize_t rc_send = send(conn->sockfd,
+                        conn->send_buffer + conn->send_pos,
+                        conn->send_len - conn->send_pos,
+                        0);
+    if (rc_send < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        connection_remove(conn);
+        return -1;
+    }
+
+    conn->send_pos += rc_send;
+    return rc_send;
 }
 
 
@@ -234,7 +299,7 @@ int connection_send_dynamic(struct connection *conn)
 
 void handle_input(struct connection *conn)
 {
-	/* TODO: Handle input information: may be a new message or notification of
+	/* Handle input information: may be a new message or notification of
 	 * completion of an asynchronous I/O operation.
 	 */
     int rc;
@@ -242,27 +307,31 @@ void handle_input(struct connection *conn)
     case STATE_INITIAL:
 	case STATE_RECEIVING_DATA:
 		receive_data(conn);
-
 		if (conn->state == STATE_CONNECTION_CLOSED)
 			return;
-		
-		rc = parse_header(conn);
+        if (conn->state == STATE_RECEIVING_DATA) {
+            handle_input(conn);
+        }
+		break;
+    case STATE_REQUEST_RECEIVED:
+        rc = parse_header(conn);
+        dlog(LOG_INFO, "in %s parsed header rc=%d\n", __func__, rc);
 		if (rc < 0)
-            // didnt read full header
 			return;
 
-		conn->state = STATE_REQUEST_RECEIVED;
-		
 		rc = connection_open_file(conn);
+        // if file was not found
+        if (rc < 0) {
+            connection_prepare_send_404(conn);
+            conn->state = STATE_SENDING_404;
+            w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
+            return;
+        }
+        connection_prepare_send_reply_header(conn);
+        conn->state = STATE_SENDING_HEADER;
+        w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
+        break;
 
-		w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
-		break;
-	
-	case STATE_ASYNC_ONGOING:
-		/* We shouldn't receive input on socket here, but this state is entered
-		   when the eventfd triggers in handle_client */
-		connection_complete_async_io(conn);
-		break;
 	default:
 		printf("shouldn't get here %d\n", conn->state);
 	}
@@ -270,11 +339,41 @@ void handle_input(struct connection *conn)
 
 void handle_output(struct connection *conn)
 {
-	/* TODO: Handle output information: may be a new valid requests or notification of
+	/* Handle output information: may be a new valid requests or notification of
 	 * completion of an asynchronous I/O operation or invalid requests.
 	 */
-
+    dlog(LOG_INFO, "in %s state=%d\n", __func__, conn->state);
 	switch (conn->state) {
+    case STATE_SENDING_HEADER:
+        {
+            int rc = connection_send_data(conn);
+            if (rc < 0)
+                return;
+
+            if (conn->send_pos < conn->send_len) {
+                // not all data sent yet
+                return;
+            }
+            dlog(LOG_INFO, "in %s header fully sent\n", __func__);
+            // header fully sent
+            conn->state = STATE_SENDING_DATA;
+        }
+        break;
+    case STATE_SENDING_404:
+        {
+            int rc = connection_send_data(conn);
+            if (rc < 0)
+                return;
+
+            if (conn->send_pos < conn->send_len) {
+                // not all data sent yet
+                return;
+            }
+
+            // 404 fully sent
+            connection_remove(conn);
+        }
+        break;
 	default:
 		ERR("Unexpected state\n");
 		exit(1);
@@ -327,16 +426,16 @@ int main(void)
 
 	/* Uncomment the following line for debugging. */
 	// dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
-
+    
 	/* server main loop */
 	while (1) {
 		struct epoll_event rev;
 
-		/* TODO: Wait for events. */
+		/* Wait for events. */
         rc = w_epoll_wait_infinite(epollfd, &rev);
 		DIE(rc < 0, "w_epoll_wait_infinite");
 
-		/* TODO: Switch event types; consider
+		/* Switch event types; consider
 		 *   - new connection requests (on server socket)
 		 *   - socket communication (on connection sockets)
 		 */
