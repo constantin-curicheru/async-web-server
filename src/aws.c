@@ -99,9 +99,40 @@ struct connection *connection_create(int sockfd)
 
 void connection_start_async_io(struct connection *conn)
 {
-	/* TODO: Start asynchronous operation (read from file).
+	/* Start asynchronous operation (read from file).
 	 * Use io_submit(2) & friends for reading data asynchronously.
 	 */
+	ssize_t bytes_to_read = conn->file_size - conn->file_pos;
+
+	if (bytes_to_read > BUFSIZ)
+		bytes_to_read = BUFSIZ;
+
+	// prepare the io control block
+	io_prep_pread(&conn->iocb,
+				   conn->fd,
+				   conn->send_buffer,
+				   bytes_to_read,
+				   conn->file_pos);
+
+	// setting eventfd for notification
+	io_set_eventfd(&conn->iocb, conn->eventfd);
+
+	// pointer to iocb
+	conn->piocb[0] = &conn->iocb;
+
+	int rc = io_submit(conn->ctx, 1, conn->piocb);
+
+	if (rc < 0) {
+		ERR("io_submit failed");
+		connection_remove(conn);
+		return;
+	}
+
+	//changing state
+	conn->state = STATE_ASYNC_ONGOING;
+
+	w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
+	w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 }
 
 void connection_remove(struct connection *conn)
@@ -194,7 +225,6 @@ int connection_open_file(struct connection *conn)
 {
 	/* Open file and update connection fields. */
 	conn->res_type = connection_get_resource_type(conn);
-	dlog(LOG_INFO, "in %s conn->req path: %s\n", __func__, conn->request_path);
 
 	if (conn->res_type == RESOURCE_TYPE_NONE)
 		return -1;
@@ -216,9 +246,26 @@ int connection_open_file(struct connection *conn)
 
 void connection_complete_async_io(struct connection *conn)
 {
-	/* TODO: Complete asynchronous operation; operation returns successfully.
+	/* Complete asynchronous operation; operation returns successfully.
 	 * Prepare socket for sending.
 	 */
+	struct io_event events[1];
+	uint64_t val;
+
+	// reading so epoll can trigger
+	read(conn->eventfd, &val, sizeof(val));
+
+	io_getevents(ctx, 1, 1, events, NULL);
+
+	// preparing to send read data
+	conn->send_len = events[0].res;
+	conn->send_pos = 0;
+	conn->file_pos += events[0].res;
+
+	// switching epoll from eventfd to sockfd
+	w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
+	w_epoll_add_ptr_out(epollfd, conn->sockfd, conn);
+	conn->state = STATE_SENDING_DATA;
 }
 
 int parse_header(struct connection *conn)
@@ -244,8 +291,6 @@ int parse_header(struct connection *conn)
 									   &settings_on_path,
 									   conn->recv_buffer,
 									   conn->recv_len);
-	dlog(LOG_INFO, "in %s bytes_parsed=%zu, recv_len=%zu, path=%s\n",
-		 __func__, bytes_parsed, conn->recv_len, conn->request_path);
 	if (bytes_parsed == conn->recv_len) {
 		// add a '.' at the beginning of the path
 		char temp[BUFSIZ];
@@ -264,7 +309,7 @@ enum connection_state connection_send_static(struct connection *conn)
 	/* Send static data using sendfile(2). */
 	ssize_t rc_sendfile = sendfile(conn->sockfd,
 								conn->fd,
-								&conn->file_pos,
+								(off_t *)&conn->file_pos,
 								conn->file_size - conn->file_pos);
 	if (rc_sendfile < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -303,12 +348,29 @@ int connection_send_data(struct connection *conn)
 
 int connection_send_dynamic(struct connection *conn)
 {
-	/* TODO: Read data asynchronously.
+	/* Read data asynchronously.
 	 * Returns 0 on success and -1 on error.
 	 */
-	return 0;
-}
+	// sending data from buffer
+	if (conn->send_pos < conn->send_len) {
+		int rc = connection_send_data(conn);
 
+		if (rc < 0)
+			return -1;
+	}
+
+	// if buffer is sent
+	if (conn->send_pos == conn->send_len) {
+		// if file sent
+		if (conn->file_pos == conn->file_size)
+			return 0;
+
+		connection_start_async_io(conn);
+	}
+
+	// still sending
+	return 1;
+}
 
 void handle_input(struct connection *conn)
 {
@@ -328,7 +390,6 @@ void handle_input(struct connection *conn)
 		break;
 	case STATE_REQUEST_RECEIVED:
 		rc = parse_header(conn);
-		dlog(LOG_INFO, "in %s parsed header rc=%d\n", __func__, rc);
 		if (rc < 0)
 			return;
 
@@ -356,7 +417,6 @@ void handle_output(struct connection *conn)
 	/* Handle output information: may be a new valid requests or notification of
 	 * completion of an asynchronous I/O operation or invalid requests.
 	 */
-	dlog(LOG_INFO, "in %s state=%d\n", __func__, conn->state);
 	switch (conn->state) {
 	case STATE_SENDING_HEADER:
 		{
@@ -429,6 +489,13 @@ void handle_client(uint32_t event, struct connection *conn)
 		return;
 	}
 
+	if (conn->state == STATE_ASYNC_ONGOING) {
+		if (event & EPOLLIN)
+			connection_complete_async_io(conn);
+		// if async didnt complete
+		return;
+	}
+
 	if (event & EPOLLIN)
 		handle_input(conn);
 
@@ -461,9 +528,6 @@ int main(void)
 	/* Add server socket to epoll object*/
 	rc = w_epoll_add_fd_in(epollfd, listenfd);
 	DIE(rc < 0, "w_epoll_add_fd_in");
-
-	/* Uncomment the following line for debugging. */
-	// dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
 
 	/* server main loop */
 	while (1) {
